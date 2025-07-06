@@ -1,0 +1,971 @@
+<?php
+session_start();
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// Константы
+define('DB_FILE', __DIR__ . '/task_planner.db');
+define('SESSION_LIFETIME', 5400); // 1 час 30 минут
+define('INACTIVITY_TIMEOUT', 1800); // 30 минут
+define('ADMIN_USERNAME', 'admin'); // Имя администратора по умолчанию
+define('ADMIN_PASSWORD', 'Aphemra1'); // Пароль администратора по умолчанию
+
+// Инициализация базы данных
+function initDatabase() {
+    $db = new SQLite3(DB_FILE);
+    
+    // Таблица пользователей
+    $db->exec("CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        email TEXT,
+        is_admin INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_login DATETIME,
+        is_active INTEGER DEFAULT 1
+    )");
+    
+    // Таблица задач
+    $db->exec("CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        date DATE NOT NULL,
+        start_time TIME NOT NULL,
+        end_time TIME NOT NULL,
+        completed INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )");
+    
+    // Таблица сессий
+    $db->exec("CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        fingerprint TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME NOT NULL,
+        last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
+        user_agent TEXT,
+        ip_address TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )");
+    
+    // Создаем администратора по умолчанию, если его нет
+    $stmt = $db->prepare("SELECT id FROM users WHERE username = :username");
+    $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+    $result = $stmt->execute();
+    
+    if (!$result->fetchArray()) {
+        $stmt = $db->prepare("INSERT INTO users (username, password_hash, is_admin) VALUES (:username, :password, 1)");
+        $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+        $stmt->bindValue(':password', password_hash(ADMIN_PASSWORD, PASSWORD_DEFAULT), SQLITE3_TEXT);
+        $stmt->execute();
+    }
+    
+    $db->close();
+}
+
+// Функция для генерации уникального идентификатора пользователя
+function generateUserFingerprint() {
+    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? 'unknown';
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $additionalSalt = 'task_planner_salt_2025';
+    return md5($userAgent . $ip . $additionalSalt);
+}
+
+// Функция для очистки истекших сессий
+function cleanupSessions() {
+    $db = new SQLite3(DB_FILE);
+    $db->exec("DELETE FROM sessions WHERE expires_at < datetime('now') OR 
+               (julianday('now') - julianday(last_activity)) * 86400 > " . INACTIVITY_TIMEOUT);
+    $db->close();
+}
+
+// Функция для создания нового пользователя
+function createUser($username, $password, $email = null, $isAdmin = false) {
+    $db = new SQLite3(DB_FILE);
+    
+    // Проверяем, существует ли пользователь
+    $stmt = $db->prepare("SELECT id FROM users WHERE username = :username");
+    $stmt->bindValue(':username', $username, SQLITE3_TEXT);
+    $result = $stmt->execute();
+    
+    if ($result->fetchArray()) {
+        $db->close();
+        return ['success' => false, 'message' => 'Пользователь с таким именем уже существует'];
+    }
+    
+    // Создаем пользователя
+    $stmt = $db->prepare("INSERT INTO users (username, password_hash, email, is_admin) VALUES (:username, :password, :email, :is_admin)");
+    $stmt->bindValue(':username', $username, SQLITE3_TEXT);
+    $stmt->bindValue(':password', password_hash($password, PASSWORD_DEFAULT), SQLITE3_TEXT);
+    $stmt->bindValue(':email', $email, SQLITE3_TEXT);
+    $stmt->bindValue(':is_admin', $isAdmin ? 1 : 0, SQLITE3_INTEGER);
+    
+    if ($stmt->execute()) {
+        $db->close();
+        return ['success' => true, 'message' => 'Пользователь успешно создан'];
+    } else {
+        $db->close();
+        return ['success' => false, 'message' => 'Ошибка при создании пользователя'];
+    }
+}
+
+// Функция для проверки авторизации
+function checkAuthorization() {
+    $userFingerprint = generateUserFingerprint();
+    
+    // Проверяем существующую сессию
+    if (isset($_SESSION['user_id'])) {
+        $db = new SQLite3(DB_FILE);
+        $stmt = $db->prepare("SELECT * FROM sessions WHERE user_id = :user_id AND fingerprint = :fingerprint AND expires_at > datetime('now')");
+        $stmt->bindValue(':user_id', $_SESSION['user_id'], SQLITE3_INTEGER);
+        $stmt->bindValue(':fingerprint', $userFingerprint, SQLITE3_TEXT);
+        $result = $stmt->execute();
+        
+        if ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            // Обновляем время последней активности
+            $stmt = $db->prepare("UPDATE sessions SET last_activity = datetime('now'), expires_at = datetime('now', '+' || :lifetime || ' seconds') WHERE id = :id");
+            $stmt->bindValue(':lifetime', SESSION_LIFETIME, SQLITE3_INTEGER);
+            $stmt->bindValue(':id', $row['id'], SQLITE3_INTEGER);
+            $stmt->execute();
+            
+            $db->close();
+            return true;
+        }
+        $db->close();
+    }
+    
+    // Обработка входа
+    if (isset($_POST['action']) && $_POST['action'] === 'login' && isset($_POST['username']) && isset($_POST['password'])) {
+        $db = new SQLite3(DB_FILE);
+        $stmt = $db->prepare("SELECT * FROM users WHERE username = :username AND is_active = 1");
+        $stmt->bindValue(':username', $_POST['username'], SQLITE3_TEXT);
+        $result = $stmt->execute();
+        
+        if ($user = $result->fetchArray(SQLITE3_ASSOC)) {
+            if (password_verify($_POST['password'], $user['password_hash'])) {
+                // Успешный вход
+                $_SESSION['user_id'] = $user['id'];
+                $_SESSION['username'] = $user['username'];
+                $_SESSION['is_admin'] = $user['is_admin'] == 1;
+                
+                // Обновляем время последнего входа
+                $stmt = $db->prepare("UPDATE users SET last_login = datetime('now') WHERE id = :id");
+                $stmt->bindValue(':id', $user['id'], SQLITE3_INTEGER);
+                $stmt->execute();
+                
+                // Создаем сессию в БД
+                $stmt = $db->prepare("INSERT INTO sessions (user_id, fingerprint, expires_at, user_agent, ip_address) 
+                                     VALUES (:user_id, :fingerprint, datetime('now', '+' || :lifetime || ' seconds'), :user_agent, :ip)");
+                $stmt->bindValue(':user_id', $user['id'], SQLITE3_INTEGER);
+                $stmt->bindValue(':fingerprint', $userFingerprint, SQLITE3_TEXT);
+                $stmt->bindValue(':lifetime', SESSION_LIFETIME, SQLITE3_INTEGER);
+                $stmt->bindValue(':user_agent', $_SERVER['HTTP_USER_AGENT'] ?? 'unknown', SQLITE3_TEXT);
+                $stmt->bindValue(':ip', $_SERVER['REMOTE_ADDR'] ?? 'unknown', SQLITE3_TEXT);
+                $stmt->execute();
+                
+                $db->close();
+                return true;
+            }
+        }
+        $db->close();
+        $_SESSION['login_error'] = 'Неверное имя пользователя или пароль';
+    }
+    
+    return false;
+}
+
+// Функция для выхода
+function logout() {
+    if (isset($_SESSION['user_id'])) {
+        $db = new SQLite3(DB_FILE);
+        $stmt = $db->prepare("DELETE FROM sessions WHERE user_id = :user_id");
+        $stmt->bindValue(':user_id', $_SESSION['user_id'], SQLITE3_INTEGER);
+        $stmt->execute();
+        $db->close();
+    }
+    
+    session_destroy();
+    header('Location: ' . $_SERVER['PHP_SELF']);
+    exit;
+}
+
+// Инициализация БД при первом запуске
+initDatabase();
+
+// Очистка старых сессий
+cleanupSessions();
+
+// Обработка регистрации
+if (isset($_POST['action']) && $_POST['action'] === 'register') {
+    $username = trim($_POST['username']);
+    $password = $_POST['password'];
+    $password_confirm = $_POST['password_confirm'];
+    $email = trim($_POST['email']);
+    
+    if (strlen($username) < 3) {
+        $_SESSION['register_error'] = 'Имя пользователя должно содержать минимум 3 символа';
+    } elseif (strlen($password) < 6) {
+        $_SESSION['register_error'] = 'Пароль должен содержать минимум 6 символов';
+    } elseif ($password !== $password_confirm) {
+        $_SESSION['register_error'] = 'Пароли не совпадают';
+    } else {
+        $result = createUser($username, $password, $email);
+        if ($result['success']) {
+            $_SESSION['register_success'] = $result['message'];
+        } else {
+            $_SESSION['register_error'] = $result['message'];
+        }
+    }
+}
+
+// Обработка действий администратора
+if (isset($_SESSION['is_admin']) && $_SESSION['is_admin'] === true) {
+    // Создание пользователя администратором
+    if (isset($_POST['action']) && $_POST['action'] === 'admin_create_user') {
+        $username = trim($_POST['username']);
+        $password = $_POST['password'];
+        $email = trim($_POST['email']);
+        $isAdmin = isset($_POST['is_admin']);
+        
+        $result = createUser($username, $password, $email, $isAdmin);
+        $_SESSION['admin_message'] = $result['message'];
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?admin=1');
+        exit;
+    }
+    
+    // Блокировка/разблокировка пользователя
+    if (isset($_POST['action']) && $_POST['action'] === 'toggle_user_status') {
+        $userId = $_POST['user_id'];
+        $db = new SQLite3(DB_FILE);
+        $stmt = $db->prepare("UPDATE users SET is_active = NOT is_active WHERE id = :id");
+        $stmt->bindValue(':id', $userId, SQLITE3_INTEGER);
+        $stmt->execute();
+        $db->close();
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?admin=1');
+        exit;
+    }
+    
+    // Удаление пользователя
+    if (isset($_POST['action']) && $_POST['action'] === 'delete_user') {
+        $userId = $_POST['user_id'];
+        if ($userId != $_SESSION['user_id']) { // Нельзя удалить себя
+            $db = new SQLite3(DB_FILE);
+            $stmt = $db->prepare("DELETE FROM users WHERE id = :id");
+            $stmt->bindValue(':id', $userId, SQLITE3_INTEGER);
+            $stmt->execute();
+            $db->close();
+        }
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?admin=1');
+        exit;
+    }
+}
+
+// Проверяем авторизацию
+$authorized = checkAuthorization();
+
+// Обработка действий с задачами (только для авторизованных)
+if ($authorized && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Добавление задачи
+    if (isset($_POST['action']) && $_POST['action'] === 'add_task') {
+        $db = new SQLite3(DB_FILE);
+        $stmt = $db->prepare("INSERT INTO tasks (user_id, title, date, start_time, end_time) VALUES (:user_id, :title, :date, :start_time, :end_time)");
+        $stmt->bindValue(':user_id', $_SESSION['user_id'], SQLITE3_INTEGER);
+        $stmt->bindValue(':title', $_POST['title'], SQLITE3_TEXT);
+        $stmt->bindValue(':date', $_POST['date'], SQLITE3_TEXT);
+        $stmt->bindValue(':start_time', $_POST['start_time'], SQLITE3_TEXT);
+        $stmt->bindValue(':end_time', $_POST['end_time'], SQLITE3_TEXT);
+        $stmt->execute();
+        $db->close();
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+    
+    // Переключение статуса задачи
+    if (isset($_POST['action']) && $_POST['action'] === 'toggle_task') {
+        $taskId = $_POST['task_id'];
+        $db = new SQLite3(DB_FILE);
+        $stmt = $db->prepare("UPDATE tasks SET completed = NOT completed WHERE id = :id AND user_id = :user_id");
+        $stmt->bindValue(':id', $taskId, SQLITE3_INTEGER);
+        $stmt->bindValue(':user_id', $_SESSION['user_id'], SQLITE3_INTEGER);
+        $stmt->execute();
+        $db->close();
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+    
+    // Удаление задачи
+    if (isset($_POST['action']) && $_POST['action'] === 'delete_task') {
+        $taskId = $_POST['task_id'];
+        $db = new SQLite3(DB_FILE);
+        $stmt = $db->prepare("DELETE FROM tasks WHERE id = :id AND user_id = :user_id");
+        $stmt->bindValue(':id', $taskId, SQLITE3_INTEGER);
+        $stmt->bindValue(':user_id', $_SESSION['user_id'], SQLITE3_INTEGER);
+        $stmt->execute();
+        $db->close();
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+    
+    // Очистка всех задач пользователя
+    if (isset($_POST['action']) && $_POST['action'] === 'clear_all_tasks') {
+        $db = new SQLite3(DB_FILE);
+        $stmt = $db->prepare("DELETE FROM tasks WHERE user_id = :user_id");
+        $stmt->bindValue(':user_id', $_SESSION['user_id'], SQLITE3_INTEGER);
+        $stmt->execute();
+        $db->close();
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+}
+
+// Если запрошен выход
+if (isset($_GET['logout'])) {
+    logout();
+}
+
+// Функции для работы с датами
+function getNext7Days() {
+    $days = [];
+    for ($i = 0; $i < 7; $i++) {
+        $date = date('Y-m-d', strtotime("+$i day"));
+        $days[$date] = [
+            'date' => $date,
+            'display' => date('d.m.Y', strtotime("+$i day")),
+            'day_name' => getDayName(date('N', strtotime("+$i day")))
+        ];
+    }
+    return $days;
+}
+
+function getDayName($dayNumber) {
+    $days = [
+        '1' => 'Понедельник',
+        '2' => 'Вторник',
+        '3' => 'Среда',
+        '4' => 'Четверг',
+        '5' => 'Пятница',
+        '6' => 'Суббота',
+        '7' => 'Воскресенье'
+    ];
+    return $days[$dayNumber];
+}
+
+// Получение задач пользователя
+function getUserTasks($userId, $date = null) {
+    $db = new SQLite3(DB_FILE);
+    if ($date) {
+        $stmt = $db->prepare("SELECT * FROM tasks WHERE user_id = :user_id AND date = :date ORDER BY start_time");
+        $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+        $stmt->bindValue(':date', $date, SQLITE3_TEXT);
+    } else {
+        $stmt = $db->prepare("SELECT * FROM tasks WHERE user_id = :user_id ORDER BY date, start_time");
+        $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    }
+    $result = $stmt->execute();
+    
+    $tasks = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $tasks[] = $row;
+    }
+    $db->close();
+    return $tasks;
+}
+
+// Получение всех пользователей (для админа)
+function getAllUsers() {
+    $db = new SQLite3(DB_FILE);
+    $result = $db->query("SELECT * FROM users ORDER BY created_at DESC");
+    
+    $users = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $users[] = $row;
+    }
+    $db->close();
+    return $users;
+}
+
+// Получение активных сессий (для админа)
+function getActiveSessions() {
+    $db = new SQLite3(DB_FILE);
+    $result = $db->query("SELECT s.*, u.username FROM sessions s 
+                         JOIN users u ON s.user_id = u.id 
+                         WHERE s.expires_at > datetime('now') 
+                         ORDER BY s.last_activity DESC");
+    
+    $sessions = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $sessions[] = $row;
+    }
+    $db->close();
+    return $sessions;
+}
+
+$days = getNext7Days();
+?>
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Планировщик задач</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f7fa;
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .week-view {
+            display: flex;
+            overflow-x: auto;
+            margin-bottom: 30px;
+            gap: 10px;
+        }
+        .day {
+            min-width: 300px;
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .day-header {
+            background: #3498db;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+        .task {
+            background: #f8f9fa;
+            border-left: 4px solid #3498db;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+        }
+        .task.completed {
+            border-left-color: #2ecc71;
+            background: #e8f5e9;
+        }
+        .task-time {
+            font-size: 0.8em;
+            color: #7f8c8d;
+        }
+        .task-title {
+            font-weight: bold;
+            margin: 5px 0;
+        }
+        .task-controls {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 5px;
+        }
+        .btn {
+            padding: 5px 10px;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.8em;
+        }
+        .btn-toggle {
+            background: #3498db;
+            color: white;
+        }
+        .btn-toggle.completed {
+            background: #2ecc71;
+        }
+        .btn-delete {
+            background: #e74c3c;
+            color: white;
+        }
+        .add-task, .form-box {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        .btn-add {
+            background: #3498db;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1em;
+        }
+        .btn-clear {
+            background: #f31a02;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1em;
+            margin-top: 10px;
+        }
+        .btn-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .error {
+            color: #e74c3c;
+            margin-bottom: 10px;
+        }
+        .success {
+            color: #2ecc71;
+            margin-bottom: 10px;
+        }
+        .user-info {
+            background: #ecf0f1;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 10px 20px;
+            background: #ecf0f1;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .tab.active {
+            background: #3498db;
+            color: white;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background: #3498db;
+            color: white;
+        }
+        .status-active {
+            color: #2ecc71;
+        }
+        .status-inactive {
+            color: #e74c3c;
+        }
+        @media (max-width: 768px) {
+            .week-view {
+                flex-direction: column;
+            }
+            .day {
+                min-width: auto;
+                margin-bottom: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <?php if (!$authorized): ?>
+        <!-- Формы входа и регистрации -->
+        <h1>Планировщик задач</h1>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('login')">Вход</button>
+            <button class="tab" onclick="showTab('register')">Регистрация</button>
+        </div>
+        
+        <!-- Форма входа -->
+        <div id="login-tab" class="tab-content active">
+            <div class="form-box">
+                <h2>Вход в систему</h2>
+                
+                <?php if (isset($_SESSION['login_error'])): ?>
+                    <div class="error"><?php echo $_SESSION['login_error']; unset($_SESSION['login_error']); ?></div>
+                <?php endif; ?>
+                
+                <?php if (isset($_SESSION['register_success'])): ?>
+                    <div class="success"><?php echo $_SESSION['register_success']; unset($_SESSION['register_success']); ?></div>
+                <?php endif; ?>
+                
+                <form method="post">
+                    <input type="hidden" name="action" value="login">
+                    
+                    <div class="form-group">
+                        <label for="username">Имя пользователя:</label>
+                        <input type="text" id="username" name="username" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="password">Пароль:</label>
+                        <input type="password" id="password" name="password" required>
+                    </div>
+                    
+                    <button type="submit" class="btn-add">Войти</button>
+                </form>
+            </div>
+        </div>
+        
+        <!-- Форма регистрации -->
+        <div id="register-tab" class="tab-content">
+            <div class="form-box">
+                <h2>Регистрация нового пользователя</h2>
+                
+                <?php if (isset($_SESSION['register_error'])): ?>
+                    <div class="error"><?php echo $_SESSION['register_error']; unset($_SESSION['register_error']); ?></div>
+                <?php endif; ?>
+                
+                <form method="post">
+                    <input type="hidden" name="action" value="register">
+                    
+                    <div class="form-group">
+                        <label for="reg_username">Имя пользователя:</label>
+                        <input type="text" id="reg_username" name="username" required minlength="3">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="reg_email">Email (необязательно):</label>
+                        <input type="email" id="reg_email" name="email">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="reg_password">Пароль:</label>
+                        <input type="password" id="reg_password" name="password" required minlength="6">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="reg_password_confirm">Подтвердите пароль:</label>
+                        <input type="password" id="reg_password_confirm" name="password_confirm" required>
+                    </div>
+                    
+                    <button type="submit" class="btn-add">Зарегистрироваться</button>
+                </form>
+            </div>
+        </div>
+        
+        <?php else: ?>
+        <!-- Основной интерфейс для авторизованных пользователей -->
+        <h1>Планировщик задач</h1>
+        
+        <div class="user-info">
+            <span>Добро пожаловать, <strong><?php echo htmlspecialchars($_SESSION['username']); ?></strong>
+            <?php if ($_SESSION['is_admin']): ?>
+                (Администратор)
+            <?php endif; ?>
+            </span>
+            <div>
+                <?php if ($_SESSION['is_admin']): ?>
+                    <a href="?admin=1" style="margin-right: 10px;">Панель администратора</a>
+                <?php endif; ?>
+                <a href="?logout=1">Выйти</a>
+            </div>
+        </div>
+        
+        <?php if (!isset($_GET['admin'])): ?>
+        <!-- Обычный вид планировщика -->
+        <div class="week-view">
+            <?php foreach ($days as $date => $day): ?>
+                <div class="day">
+                    <div class="day-header">
+                        <div><?php echo $day['day_name']; ?></div>
+                        <div><?php echo $day['display']; ?></div>
+                    </div>
+                    
+                    <?php 
+                    $dayTasks = getUserTasks($_SESSION['user_id'], $date);
+                    
+                    if (empty($dayTasks)): 
+                    ?>
+                        <p style="text-align: center; color: #7f8c8d;">Нет задач</p>
+                    <?php else: ?>
+                        <?php foreach ($dayTasks as $task): ?>
+                            <div class="task <?php echo $task['completed'] ? 'completed' : ''; ?>">
+                                <div class="task-time">
+                                    <?php echo $task['start_time']; ?> - <?php echo $task['end_time']; ?>
+                                </div>
+                                <div class="task-title"><?php echo htmlspecialchars($task['title']); ?></div>
+                                <div class="task-controls">
+                                    <form method="post" style="display: inline;">
+                                        <input type="hidden" name="action" value="toggle_task">
+                                        <input type="hidden" name="task_id" value="<?php echo $task['id']; ?>">
+                                        <button type="submit" class="btn btn-toggle <?php echo $task['completed'] ? 'completed' : ''; ?>">
+                                            <?php echo $task['completed'] ? 'Выполнено' : 'Отметить выполненным'; ?>
+                                        </button>
+                                    </form>
+                                    <form method="post" style="display: inline;">
+                                        <input type="hidden" name="action" value="delete_task">
+                                        <input type="hidden" name="task_id" value="<?php echo $task['id']; ?>">
+                                        <button type="submit" class="btn btn-delete">Удалить</button>
+                                    </form>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+            <?php endforeach; ?>
+        </div>
+        
+        <!-- Форма добавления задачи -->
+        <div class="add-task">
+            <h2>Добавить новую задачу</h2>
+            <form method="post">
+                <input type="hidden" name="action" value="add_task">
+                
+                <div class="form-group">
+                    <label for="title">Название задачи:</label>
+                    <input type="text" id="title" name="title" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="date">Дата:</label>
+                    <select id="date" name="date" required>
+                        <?php foreach ($days as $date => $day): ?>
+                            <option value="<?php echo $date; ?>"><?php echo $day['display'] . ' (' . $day['day_name'] . ')'; ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="start_time">Время начала:</label>
+                    <input type="time" id="start_time" name="start_time" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="end_time">Время окончания:</label>
+                    <input type="time" id="end_time" name="end_time" required>
+                </div>
+                
+                <button type="submit" class="btn-add">Добавить задачу</button>
+            </form>
+            
+            <form method="post">
+                <input type="hidden" name="action" value="clear_all_tasks">
+                <button type="submit" class="btn-clear" onclick="return confirm('Вы уверены, что хотите удалить все задачи?')">Очистить все задачи</button>
+            </form>
+        </div>
+        
+        <?php else: ?>
+        <!-- Панель администратора -->
+        <div class="add-task">
+            <h2>Панель администратора</h2>
+            <a href="<?php echo $_SERVER['PHP_SELF']; ?>" style="display: inline-block; margin-bottom: 20px;">← Вернуться к задачам</a>
+            
+            <?php if (isset($_SESSION['admin_message'])): ?>
+                <div class="success"><?php echo $_SESSION['admin_message']; unset($_SESSION['admin_message']); ?></div>
+            <?php endif; ?>
+            
+            <div class="tabs">
+                <button class="tab active" onclick="showAdminTab('users')">Пользователи</button>
+                <button class="tab" onclick="showAdminTab('sessions')">Активные сессии</button>
+                <button class="tab" onclick="showAdminTab('create')">Создать пользователя</button>
+            </div>
+            
+            <!-- Список пользователей -->
+            <div id="users-tab" class="tab-content active">
+                <h3>Управление пользователями</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Имя пользователя</th>
+                            <th>Email</th>
+                            <th>Админ</th>
+                            <th>Статус</th>
+                            <th>Создан</th>
+                            <th>Последний вход</th>
+                            <th>Действия</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach (getAllUsers() as $user): ?>
+                            <tr>
+                                <td><?php echo $user['id']; ?></td>
+                                <td><?php echo htmlspecialchars($user['username']); ?>
+                                    <?php if ($user['id'] == $_SESSION['user_id']): ?>
+                                        <span style="color: green;">(Вы)</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($user['email'] ?? '-'); ?></td>
+                                <td><?php echo $user['is_admin'] ? 'Да' : 'Нет'; ?></td>
+                                <td class="<?php echo $user['is_active'] ? 'status-active' : 'status-inactive'; ?>">
+                                    <?php echo $user['is_active'] ? 'Активен' : 'Заблокирован'; ?>
+                                </td>
+                                <td><?php echo date('d.m.Y H:i', strtotime($user['created_at'])); ?></td>
+                                <td><?php echo $user['last_login'] ? date('d.m.Y H:i', strtotime($user['last_login'])) : 'Никогда'; ?></td>
+                                <td>
+                                    <?php if ($user['id'] != $_SESSION['user_id']): ?>
+                                        <form method="post" style="display: inline;">
+                                            <input type="hidden" name="action" value="toggle_user_status">
+                                            <input type="hidden" name="user_id" value="<?php echo $user['id']; ?>">
+                                            <button type="submit" class="btn btn-toggle">
+                                                <?php echo $user['is_active'] ? 'Заблокировать' : 'Разблокировать'; ?>
+                                            </button>
+                                        </form>
+                                        <form method="post" style="display: inline;">
+                                            <input type="hidden" name="action" value="delete_user">
+                                            <input type="hidden" name="user_id" value="<?php echo $user['id']; ?>">
+                                            <button type="submit" class="btn btn-delete" onclick="return confirm('Удалить пользователя?')">Удалить</button>
+                                        </form>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- Активные сессии -->
+            <div id="sessions-tab" class="tab-content">
+                <h3>Активные сессии</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Пользователь</th>
+                            <th>IP</th>
+                            <th>User Agent</th>
+                            <th>Создана</th>
+                            <th>Истекает</th>
+                            <th>Последняя активность</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach (getActiveSessions() as $session): ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($session['username']); ?></td>
+                                <td><?php echo $session['ip_address']; ?></td>
+                                <td title="<?php echo htmlspecialchars($session['user_agent']); ?>">
+                                    <?php echo substr($session['user_agent'], 0, 50) . '...'; ?>
+                                </td>
+                                <td><?php echo date('d.m.Y H:i', strtotime($session['created_at'])); ?></td>
+                                <td><?php echo date('d.m.Y H:i', strtotime($session['expires_at'])); ?></td>
+                                <td><?php echo date('d.m.Y H:i', strtotime($session['last_activity'])); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- Создание пользователя -->
+            <div id="create-tab" class="tab-content">
+                <h3>Создать нового пользователя</h3>
+                <form method="post">
+                    <input type="hidden" name="action" value="admin_create_user">
+                    
+                    <div class="form-group">
+                        <label for="new_username">Имя пользователя:</label>
+                        <input type="text" id="new_username" name="username" required minlength="3">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="new_email">Email (необязательно):</label>
+                        <input type="email" id="new_email" name="email">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="new_password">Пароль:</label>
+                        <input type="password" id="new_password" name="password" required minlength="6">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" name="is_admin" value="1">
+                            Сделать администратором
+                        </label>
+                    </div>
+                    
+                    <button type="submit" class="btn-add">Создать пользователя</button>
+                </form>
+            </div>
+        </div>
+        <?php endif; ?>
+        
+        <?php endif; ?>
+    </div>
+    
+    <script>
+        function showTab(tabName) {
+            // Скрыть все вкладки
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            // Показать выбранную вкладку
+            document.getElementById(tabName + '-tab').classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        function showAdminTab(tabName) {
+            // Скрыть все админские вкладки
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            // Показать выбранную вкладку
+            document.getElementById(tabName + '-tab').classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        // Обновление сессии каждые 20 минут
+        function keepSessionAlive() {
+            fetch(window.location.href, { 
+                method: 'HEAD',
+                credentials: 'same-origin'
+            });
+        }
+        
+        setInterval(keepSessionAlive, 1200000);
+    </script>
+</body>
+</html>
